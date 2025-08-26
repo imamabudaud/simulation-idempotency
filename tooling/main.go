@@ -24,10 +24,9 @@ func main() {
 		fmt.Println("Commands:")
 		fmt.Println("  resetdb                    - Reset all database tables")
 		fmt.Println("  simulator <count>          - Run simulation with specified count")
-		fmt.Println("  settlement                 - Print today's external settlement")
+		fmt.Println("  external-settlement        - Print today's external settlement")
 		fmt.Println("  internal-settlement        - Print today's internal settlement")
-		fmt.Println("  full-settlement            - Print comprehensive settlement (both)")
-		fmt.Println("  fulfillment-audit          - Print fulfillment attempts audit log")
+		fmt.Println("  attempt                    - Print fulfillment attempts audit log")
 		os.Exit(1)
 	}
 
@@ -56,12 +55,10 @@ func main() {
 			os.Exit(1)
 		}
 		runSimulator(count)
-	case "settlement":
-		printSettlement()
+	case "external-settlement":
+		printExternalSettlement()
 	case "internal-settlement":
 		printInternalSettlement()
-	case "full-settlement":
-		printFullSettlement()
 	case "attempt":
 		printAttempt()
 	default:
@@ -227,7 +224,7 @@ func triggerPayment(orderID string, amount int) error {
 	return nil
 }
 
-func printSettlement() {
+func printExternalSettlement() {
 	checkDatabaseTimezone()
 	today, startOfDay, endOfDay := getTodayDateRange()
 	jakartaLoc := getJakartaLocation()
@@ -235,7 +232,7 @@ func printSettlement() {
 	slog.Info("Printing settlement", "date", today, "timezone", jakartaLoc.String(), "local_time", time.Now().Format("2006-01-02 15:04:05 -0700"))
 	slog.Info("Date range for query", "start", startOfDay.Format("2006-01-02 15:04:05 -0700"), "end", endOfDay.Format("2006-01-02 15:04:05 -0700"))
 
-	query := `SELECT id, order_id, amount, destination_phone, processed_at
+	query := `SELECT id, order_id, amount, destination_phone, status, processed_at
 			  FROM ext_orders
 			  WHERE processed_at >= ? AND processed_at < ?
 			  ORDER BY processed_at ASC`
@@ -247,37 +244,53 @@ func printSettlement() {
 	}
 	defer rows.Close()
 
-	fmt.Printf("Settlement for %s (%s):\n", today, jakartaLoc.String())
-	fmt.Println("┌─────┬──────────────────────────────────────┬────────┬──────────────────┬─────────────────────────────┐")
-	fmt.Println("│ ID  │ Order ID                             │ Amount │ Destination      │ Processed At                │")
-	fmt.Println("├─────┼──────────────────────────────────────┼────────┼──────────────────┼─────────────────────────────┤")
+	table := NewTable("Settlement for " + today + " (" + jakartaLoc.String() + ")")
+	table.AddColumn("ID", 3, "left", nil)
+	table.AddColumn("Order ID", 38, "left", nil)
+	table.AddColumn("Amount", 8, "right", nil)
+	table.AddColumn("Status", 9, "left", nil)
+	table.AddColumn("Destination", 15, "left", nil)
+	table.AddColumn("Processed At", 21, "left", nil)
 
+	table.PrintHeader()
+
+	totalSettledAmount := 0
+	totalFailedAmount := 0
 	var orders []models.ExtOrder
 	for rows.Next() {
 		var order models.ExtOrder
-		if err := rows.Scan(&order.ID, &order.OrderID, &order.Amount, &order.DestinationPhone, &order.ProcessedAt); err != nil {
+		if err := rows.Scan(&order.ID, &order.OrderID, &order.Amount, &order.DestinationPhone, &order.Status, &order.ProcessedAt); err != nil {
 			slog.Error("Failed to scan order", "error", err)
 			continue
+		}
+		if order.Status == "success" {
+			totalSettledAmount += order.Amount
+		} else {
+			totalFailedAmount += order.Amount
 		}
 		orders = append(orders, order)
 	}
 
 	if len(orders) == 0 {
-		fmt.Println("│     │ No orders processed today            │        │                  │                             │")
+		table.PrintEmptyRow("No orders processed today")
 	} else {
 		for _, order := range orders {
 			processedTime := order.ProcessedAt.In(jakartaLoc)
-			fmt.Printf("│ %3d │ %-36s │ %6d │ %-16s │ %-27s │\n",
+			table.PrintRow([]interface{}{
 				order.ID,
 				truncateString(order.OrderID, 36),
 				order.Amount,
+				order.Status,
 				truncateString(order.DestinationPhone, 16),
-				processedTime.Format("2006-01-02 15:04:05"))
+				processedTime.Format("2006-01-02 15:04:05"),
+			})
 		}
 	}
 
-	fmt.Println("└─────┴──────────────────────────────────────┴────────┴──────────────────┴─────────────────────────────┘")
+	table.PrintFooter()
 	fmt.Printf("Total orders: %d\n", len(orders))
+	fmt.Println("Total settled amount: ", totalSettledAmount)
+	fmt.Println("Total failed amount: ", totalFailedAmount)
 }
 
 func printInternalSettlement() {
@@ -300,140 +313,51 @@ func printInternalSettlement() {
 	}
 	defer rows.Close()
 
-	fmt.Printf("Internal Settlement for %s (%s):\n", today, jakartaLoc.String())
-	fmt.Println("┌─────┬────────┬──────────┬──────────┬──────────────────┬─────────────────────────────┐")
-	fmt.Println("│ ID  │ Amount │ Admin Fee│ Operator │ Destination      │ Created At                  │")
-	fmt.Println("├─────┼────────┼──────────┼──────────┼──────────────────┼─────────────────────────────┤")
+	table := NewTable("Internal Settlement for " + today + " (" + jakartaLoc.String() + ")")
+	table.AddColumn("Order ID", 38, "left", nil)
+	table.AddColumn("Amount", 7, "right", nil)
+	table.AddColumn("Fee", 4, "right", nil)
+	table.AddColumn("Status", 12, "left", nil)
+	table.AddColumn("Operator", 10, "left", nil)
+	table.AddColumn("Destination", 15, "left", nil)
+	table.AddColumn("Created At", 21, "left", nil)
+
+	table.PrintHeader()
 
 	var orders []models.Order
+	totalFulfilledAmount := 0
 	for rows.Next() {
 		var order models.Order
 		if err := rows.Scan(&order.ID, &order.Amount, &order.AdminFee, &order.Type, &order.Operator, &order.DestinationPhone, &order.Total, &order.Status, &order.CreatedAt); err != nil {
 			slog.Error("Failed to scan internal order", "error", err)
 			continue
 		}
+		if order.Status == "fulfilment" {
+			totalFulfilledAmount += order.Total
+		}
 		orders = append(orders, order)
 	}
 
 	if len(orders) == 0 {
-		fmt.Println("│ No internal orders created today                                                                    │")
+		table.PrintEmptyRow("No internal orders created today")
 	} else {
 		for _, order := range orders {
 			createdTime := order.CreatedAt.In(jakartaLoc)
-			fmt.Printf("│ %-36s │ %6d │ %8d │ %-8s │ %-16s │ %-27s │\n",
+			table.PrintRow([]interface{}{
 				truncateString(order.ID, 36),
 				order.Amount,
 				order.AdminFee,
+				order.Status,
 				truncateString(order.Operator, 8),
 				truncateString(order.DestinationPhone, 16),
-				createdTime.Format("2006-01-02 15:04:05"))
+				createdTime.Format("2006-01-02 15:04:05"),
+			})
 		}
 	}
 
-	fmt.Println("└──────────────────────────────────────┴────────┴──────────┴──────────┴──────────────────┴─────────────────────────────┘")
+	table.PrintFooter()
 	fmt.Printf("Total internal orders: %d\n", len(orders))
-}
-
-func printFullSettlement() {
-	checkDatabaseTimezone()
-	today, startOfDay, endOfDay := getTodayDateRange()
-	jakartaLoc := getJakartaLocation()
-
-	slog.Info("Printing comprehensive settlement", "date", today, "timezone", jakartaLoc.String(), "local_time", time.Now().Format("2006-01-02 15:04:05 -0700"))
-	slog.Info("Date range for query", "start", startOfDay.Format("2006-01-02 15:04:05 -0700"), "end", endOfDay.Format("2006-01-02 15:04:05 -0700"))
-
-	queryExt := `SELECT id, order_id, amount, destination_phone, processed_at
-				  FROM ext_orders
-				  WHERE processed_at >= ? AND processed_at < ?
-				  ORDER BY processed_at ASC`
-
-	queryInt := `SELECT id, amount, admin_fee, type, operator, destination_phone, total, status, created_at
-				  FROM internal_orders
-				  WHERE created_at >= ? AND created_at < ?
-				  ORDER BY created_at ASC`
-
-	rowsExt, err := database.DB.Query(queryExt, startOfDay, endOfDay)
-	if err != nil {
-		slog.Error("Failed to query external settlement", "error", err)
-		return
-	}
-	defer rowsExt.Close()
-
-	rowsInt, err := database.DB.Query(queryInt, startOfDay, endOfDay)
-	if err != nil {
-		slog.Error("Failed to query internal settlement", "error", err)
-		return
-	}
-	defer rowsInt.Close()
-
-	fmt.Printf("Comprehensive Settlement for %s (%s):\n", today, jakartaLoc.String())
-
-	fmt.Println("EXTERNAL ORDERS (From Vendor Report):")
-	fmt.Println("┌─────┬──────────────────────────────────────┬────────┬──────────────────┬─────────────────────────────┐")
-	fmt.Println("│ ID  │ Order ID                             │ Amount │ Destination      │ Processed At                │")
-	fmt.Println("├─────┼──────────────────────────────────────┼────────┼──────────────────┼─────────────────────────────┤")
-
-	var extOrders []models.ExtOrder
-	for rowsExt.Next() {
-		var order models.ExtOrder
-		if err := rowsExt.Scan(&order.ID, &order.OrderID, &order.Amount, &order.DestinationPhone, &order.ProcessedAt); err != nil {
-			slog.Error("Failed to scan external order", "error", err)
-			continue
-		}
-		extOrders = append(extOrders, order)
-	}
-
-	if len(extOrders) == 0 {
-		fmt.Println("│     │ No external orders processed today   │        │                  │                             │")
-	} else {
-		for _, order := range extOrders {
-			processedTime := order.ProcessedAt.In(jakartaLoc)
-			fmt.Printf("│ %3d │ %-36s │ %6d │ %-16s │ %-27s │\n",
-				order.ID,
-				truncateString(order.OrderID, 36),
-				order.Amount,
-				truncateString(order.DestinationPhone, 16),
-				processedTime.Format("2006-01-02 15:04:05"))
-		}
-	}
-
-	fmt.Println("└─────┴──────────────────────────────────────┴────────┴──────────────────┴─────────────────────────────┘")
-	fmt.Printf("Total external orders: %d\n\n", len(extOrders))
-
-	fmt.Println("INTERNAL ORDERS (Your Company):")
-	fmt.Println("┌──────────────────────────────────────┬────────┬──────────┬──────────┬──────────────────┬─────────────────────────────┐")
-	fmt.Println("│ Order ID                             │ Amount │ Admin Fee│ Operator │ Destination      │ Created At                  │")
-	fmt.Println("├──────────────────────────────────────┼────────┼──────────┼──────────┼──────────────────┼─────────────────────────────┤")
-
-	var intOrders []models.Order
-	for rowsInt.Next() {
-		var order models.Order
-		if err := rowsInt.Scan(&order.ID, &order.Amount, &order.AdminFee, &order.Type, &order.Operator, &order.DestinationPhone, &order.Total, &order.Status, &order.CreatedAt); err != nil {
-			slog.Error("Failed to scan internal order", "error", err)
-			continue
-		}
-		intOrders = append(intOrders, order)
-	}
-
-	if len(intOrders) == 0 {
-		fmt.Println("│ No internal orders created today                                                                    │")
-	} else {
-		for _, order := range intOrders {
-			createdTime := order.CreatedAt.In(jakartaLoc)
-			fmt.Printf("│ %-36s │ %6d │ %8d │ %-8s │ %-16s │ %-27s │\n",
-				truncateString(order.ID, 36),
-				order.Amount,
-				order.AdminFee,
-				truncateString(order.Operator, 8),
-				truncateString(order.DestinationPhone, 16),
-				createdTime.Format("2006-01-02 15:04:05"))
-		}
-	}
-
-	fmt.Println("└──────────────────────────────────────┴────────┴──────────┴──────────┴──────────────────┴─────────────────────────────┘")
-	fmt.Printf("Total internal orders: %d\n\n", len(intOrders))
-
-	fmt.Printf("SUMMARY: External: %d, Internal: %d\n", len(extOrders), len(intOrders))
+	fmt.Println("Total fulfilled amount: ", totalFulfilledAmount)
 }
 
 func printAttempt() {
@@ -443,10 +367,15 @@ func printAttempt() {
 
 	slog.Info("Printing fulfillment audit", "date", today, "timezone", jakartaLoc.String())
 
-	query := `SELECT id, order_id, attempt_number, payload, attempted_at
-			  FROM fulfillment_attempts
-			  WHERE attempted_at >= ? AND attempted_at < ?
-			  ORDER BY attempted_at DESC`
+	query := `SELECT 
+				fa.id, 
+				fa.order_id, 
+				fa.payload, 
+				fa.attempted_at,
+				ROW_NUMBER() OVER (PARTITION BY fa.order_id ORDER BY fa.attempted_at ASC) as attempt_number
+			  FROM fulfillment_attempts fa
+			  WHERE fa.attempted_at >= ? AND fa.attempted_at < ?
+			  ORDER BY fa.order_id, fa.attempted_at DESC`
 
 	rows, err := database.DB.Query(query, startOfDay, endOfDay)
 	if err != nil {
@@ -455,15 +384,32 @@ func printAttempt() {
 	}
 	defer rows.Close()
 
-	fmt.Printf("Fulfillment Audit for %s (%s):\n", today, jakartaLoc.String())
-	fmt.Println("┌─────┬──────────────────────────────────────┬──────────────┬──────────────────────────────────────┬─────────────────────────────┐")
-	fmt.Println("│ ID  │ Order ID                             │ Attempt #    │ Payload                              │ Attempted At                │")
-	fmt.Println("├─────┼──────────────────────────────────────┼──────────────┼──────────────────────────────────────┼─────────────────────────────┤")
+	table := NewTable("Fulfillment Audit for " + today + " (" + jakartaLoc.String() + ")")
+	table.AddColumn("ID", 3, "left", nil)
+	table.AddColumn("Order ID", 38, "left", nil)
+	table.AddColumn("Attempt", 9, "right", nil)
+	table.AddColumn("Payload", 60, "left", nil)
+	table.AddColumn("Attempted At", 21, "left", nil)
 
-	var attempts []models.FulfillmentAttempt
+	table.PrintHeader()
+
+	var attempts []struct {
+		ID            int
+		OrderID       string
+		Payload       string
+		AttemptedAt   time.Time
+		AttemptNumber int
+	}
+
 	for rows.Next() {
-		var attempt models.FulfillmentAttempt
-		if err := rows.Scan(&attempt.ID, &attempt.OrderID, &attempt.AttemptNumber, &attempt.Payload, &attempt.AttemptedAt); err != nil {
+		var attempt struct {
+			ID            int
+			OrderID       string
+			Payload       string
+			AttemptedAt   time.Time
+			AttemptNumber int
+		}
+		if err := rows.Scan(&attempt.ID, &attempt.OrderID, &attempt.Payload, &attempt.AttemptedAt, &attempt.AttemptNumber); err != nil {
 			slog.Error("Failed to scan fulfillment attempt", "error", err)
 			continue
 		}
@@ -471,20 +417,21 @@ func printAttempt() {
 	}
 
 	if len(attempts) == 0 {
-		fmt.Println("│     │ No fulfillment attempts today        │              │                                      │                             │")
+		table.PrintEmptyRow("No fulfillment attempts today")
 	} else {
 		for _, attempt := range attempts {
 			attemptedTime := attempt.AttemptedAt.In(jakartaLoc)
-			fmt.Printf("│ %3d │ %-36s │ %12d │ %-36s │ %-27s │\n",
+			table.PrintRow([]interface{}{
 				attempt.ID,
 				truncateString(attempt.OrderID, 36),
 				attempt.AttemptNumber,
-				truncateString(attempt.Payload, 36),
-				attemptedTime.Format("2006-01-02 15:04:05"))
+				truncateString(attempt.Payload, 58),
+				attemptedTime.Format("2006-01-02 15:04:05"),
+			})
 		}
 	}
 
-	fmt.Println("└─────┴──────────────────────────────────────┴──────────────┴──────────────────────────────────────┴─────────────────────────────┘")
+	table.PrintFooter()
 	fmt.Printf("Total fulfillment attempts: %d\n", len(attempts))
 }
 
@@ -530,4 +477,139 @@ func truncateString(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen-3] + "..."
+}
+
+type TableColumn struct {
+	Header     string
+	Width      int
+	Alignment  string // "left", "right", "center"
+	FormatFunc func(interface{}) string
+}
+
+type Table struct {
+	columns []TableColumn
+	title   string
+}
+
+func NewTable(title string) *Table {
+	return &Table{
+		title:   title,
+		columns: make([]TableColumn, 0),
+	}
+}
+
+func (t *Table) AddColumn(header string, width int, alignment string, formatFunc func(interface{}) string) {
+	t.columns = append(t.columns, TableColumn{
+		Header:     header,
+		Width:      width,
+		Alignment:  alignment,
+		FormatFunc: formatFunc,
+	})
+}
+
+func (t *Table) PrintHeader() {
+	if t.title != "" {
+		fmt.Printf("%s:\n", t.title)
+	}
+
+	// Print top border
+	fmt.Print("┌")
+	for i, col := range t.columns {
+		if i > 0 {
+			fmt.Print("┬")
+		}
+		fmt.Print(strings.Repeat("─", col.Width))
+	}
+	fmt.Println("┐")
+
+	// Print header row
+	fmt.Print("│")
+	for i, col := range t.columns {
+		if i > 0 {
+			fmt.Print("│")
+		}
+		fmt.Printf(" %-*s", col.Width-1, col.Header)
+	}
+	fmt.Println("│")
+
+	// Print separator
+	fmt.Print("├")
+	for i, col := range t.columns {
+		if i > 0 {
+			fmt.Print("┼")
+		}
+		fmt.Print(strings.Repeat("─", col.Width))
+	}
+	fmt.Println("┤")
+}
+
+func (t *Table) PrintRow(data []interface{}) {
+	if len(data) != len(t.columns) {
+		return
+	}
+
+	fmt.Print("│")
+	for i, col := range t.columns {
+		if i > 0 {
+			fmt.Print("│")
+		}
+
+		var value string
+		if col.FormatFunc != nil {
+			value = col.FormatFunc(data[i])
+		} else {
+			value = fmt.Sprintf("%v", data[i])
+		}
+
+		switch col.Alignment {
+		case "right":
+			fmt.Printf(" %*s", col.Width-1, value)
+		case "center":
+			padding := col.Width - len(value)
+			left := padding / 2
+			right := padding - left
+			fmt.Printf(" %*s%s%*s", left, "", value, right, "")
+		default: // left
+			fmt.Printf(" %-*s", col.Width-1, value)
+		}
+	}
+	fmt.Println("│")
+}
+
+func (t *Table) PrintEmptyRow(message string) {
+	// Calculate total width for the message
+	totalWidth := 0
+	for _, col := range t.columns {
+		totalWidth += col.Width
+	}
+	totalWidth += len(t.columns) - 1 // Add separator characters
+
+	// Center the message
+	padding := totalWidth - len(message)
+	left := padding / 2
+	right := padding - left
+
+	fmt.Print("│")
+	for i, col := range t.columns {
+		if i > 0 {
+			fmt.Print("│")
+		}
+		if i == 0 {
+			fmt.Printf(" %*s%s%*s", left, "", message, right, "")
+		} else {
+			fmt.Printf(" %*s", col.Width-1, "")
+		}
+	}
+	fmt.Println("│")
+}
+
+func (t *Table) PrintFooter() {
+	fmt.Print("└")
+	for i, col := range t.columns {
+		if i > 0 {
+			fmt.Print("┴")
+		}
+		fmt.Print(strings.Repeat("─", col.Width))
+	}
+	fmt.Println("┘")
 }
