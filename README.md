@@ -118,13 +118,9 @@ go run tooling/main.go external-settlement
 go run tooling/main.go full-settlement
 ```
 
-
-## Testing
-
-Test payment trigger manually:
+### Print Audit Attempt
 ```bash
-chmod +x test-payment.sh
-./test-payment.sh
+go run tooling/main.go attempt
 ```
 
 ## Configuration
